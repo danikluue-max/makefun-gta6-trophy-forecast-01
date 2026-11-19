@@ -1,20 +1,26 @@
-"""GTA VI trophy rarity forecast: cohort-accounting forecaster.
+"""GTA VI trophy rarity forecast: cohort-accounting forecaster, round 2.
 
-The idea in one paragraph. Exophase's page only changes when it refreshes,
-and one refresh does two things at once: it adds newly tracked players (who
-have earned almost nothing yet) and it records the progress of the players
-already tracked. So a trophy's earn rate is a ratio of two counts -- earners
-over players tracked -- and this program works in counts, not rates. It reads
-every refresh step in the case's history, measures how many earners each step
-added per newly tracked player (the cohort earn rate), fits how the tracked
-player count itself grows, and rolls both forward to the target: future
-earners = today's earners + future new players x cohort earn rate, future
-rate = future earners / future players. When the history is flat (no refresh
-seen yet) it falls back on a launch-night prior: one refresh is due, players
-multiply, and the new cohort holds the one trophy everybody gets plus a small
-share of every other trophy's current rate. A log-time trend line is blended
-in when the history has real movement, and the spread comes from how much the
-refresh steps disagree with each other.
+Round 1 scored practice loss 0.139 (rank #101): its 90% coverage was only
+0.7273 -- the flat-history prior spread (0.20 logit) was far too narrow
+for a refresh jump -- and on multi-refresh histories its spread blew up
+to ~1.1 logit (median error only ~0.3), because a whole-history log-time
+trend on a saturating earn curve leaves 0.5-1.0 logit residuals and the
+accounting/trend disagreement was charged as spread on top.
+
+Round 2 keeps round 1's counts-based core (split each refresh step into
+old-player progress vs new-cohort earns; power-law players-tracked
+growth) and fixes the calibration:
+- prior spread 0.20 -> 0.30, prior cohort 0.07 -> 0.06 of the current
+  rate (the median new-cohort rate sits below the mean: earns concentrate);
+- players-tracked extrapolation from a recency-weighted power-law fit
+  (the whole-history fit overshot the target N ~1.9x);
+- the log-time trend is fitted on the last 24h of reads only, where the
+  saturating curve is locally linear;
+- cohort and progress rates are shrunk toward their tier's pooled rates
+  (rare trophies' own steps are a handful of earns);
+- the spread is rebuilt from honest components only (weighted step
+  disagreement over the last 24h, recent-trend residual, players-tracked
+  uncertainty), capped at 0.55, growing with the horizon.
 
 Standard library only, no network, deterministic: the same case always
 writes the same bytes.
@@ -41,11 +47,35 @@ NORM = NormalDist()
 # 4,276 trophies earned. The one trophy at 100% accounts for 3,230 of the
 # 3,333 new earns; the other 103 earns spread over the remaining trophies
 # are ~7% of what those trophies' current rates would give at full strength.
+# The median new-cohort rate sits BELOW that mean: the earns concentrate on
+# a few trophies, so most trophies get less than the mean (BETA 0.06, not
+# 0.07). PRIOR_SPREAD 0.30 is the calibrated logit sigma of the refresh
+# jump: count noise on a handful of new earns per trophy plus growth
+# uncertainty put the true rate ~0.3 logit from the median (round 1's 0.20
+# covered only 73% of practice trophies; 0.30 covers ~90%).
 PRIOR_GROWTH = 6.0        # players tracked multiply by ~6 at a refresh
-PRIOR_BETA = 0.07         # new cohort earns ~7% of a trophy's current rate
-PRIOR_SPREAD = 0.20       # logit sigma when no refresh has been observed
+PRIOR_BETA = 0.06         # new cohort earns ~6% of a trophy's current rate
+PRIOR_SPREAD = 0.30       # logit sigma when no refresh has been observed
 FLOOR_SPREAD = 0.15       # logit sigma floor once steps are observed
-CAP_SPREAD = 0.90
+CAP_SPREAD = 0.55         # round 1's 0.90 let saturating-trend artefacts
+                          # inflate the band to ~1.1 logit; the true median
+                          # error on multi-refresh histories is ~0.3
+HORIZON_COEF = 0.25       # spread grows with the horizon: a 4.5-day
+                          # forecast faces regime shifts (weekend surge,
+                          # progress stalling) that a 90-minute one does
+                          # not; 0.25 buys shock insurance cheaply
+N_SPREAD = 0.15           # logit sigma from players-tracked uncertainty
+TREND_BLEND = 0.15        # weight of the recent log-time trend in the
+                          # median: the trend wins when the future stays
+                          # smooth, the accounting wins when dilution
+                          # dominates (weekend surge, progress stalling);
+                          # 0.15 is the robust middle across both worlds
+SHRINK_E0 = 15.0          # pseudo-earners pulling a trophy's cohort and
+                          # progress rates toward its tier's pooled rates
+STEP_WINDOW_H = 24.0      # only steps from the last 24h feed the spread:
+                          # the launch regime's cohort rates are not the
+                          # future regime's, and their disagreement is not
+                          # forecast uncertainty
 RELEASE = datetime(2026, 11, 19, tzinfo=timezone.utc)
 
 
@@ -98,6 +128,24 @@ def least_squares(xs, ys):
     intercept = my - slope * mx
     resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
     var = sum(r * r for r in resid) / max(1, n - 2)
+    return slope, intercept, math.sqrt(var)
+
+
+def weighted_least_squares(xs, ys, ws):
+    """Weighted slope, intercept and residual std of y on x."""
+    wsum = sum(ws)
+    if wsum <= 0 or len(xs) < 2:
+        return None
+    mx = sum(w * x for w, x in zip(ws, xs)) / wsum
+    my = sum(w * y for w, y in zip(ws, ys)) / wsum
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
+    if sxx <= 1e-12:
+        return None
+    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    resid = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    var = sum(w * r * r for w, r in zip(ws, resid)) / wsum
     return slope, intercept, math.sqrt(var)
 
 
@@ -179,7 +227,7 @@ def analyse_case(case):
         age_h = max(0.0, (last_moment - tb).total_seconds() / 3600.0)
         weight = dn * (0.5 ** (age_h / 24.0))
         steps.append((weight, dn, nb / na, dt, cohort))
-        step_rows.append((weight, dt, na, ra, rb))
+        step_rows.append((weight, dt, na, ra, rb, tb))
 
     def two_component(i, c_pool):
         """(progress_per_hour, cohort_rate) for trophy i from the steps.
@@ -193,7 +241,7 @@ def analyse_case(case):
         if len(step_rows) < 3:
             return 0.0, c_pool
         s11 = s12 = s22 = t1 = t2 = 0.0
-        for k, (w, dt, na, ra, rb) in enumerate(step_rows):
+        for k, (w, dt, na, ra, rb, _tb) in enumerate(step_rows):
             dn = steps[k][1]
             nb = na + dn
             y = nb * rb[i] / 100.0 - na * ra[i] / 100.0
@@ -226,10 +274,17 @@ def analyse_case(case):
         wsum = sum(s[0] for s in steps)
         g_hat = math.exp(sum(s[0] * math.log(s[2]) for s in steps) / wsum)
         interval = sum(s[0] * s[3] for s in steps) / wsum
-        # Power-law fit of ln N on ln(1 + hours since release), dampened growth.
+        # Power-law fit of ln N on ln(1 + hours since release). Player
+        # growth is fastest at launch and slows after: a fit over the whole
+        # history is dominated by the launch explosion and overshoots the
+        # target (on multi-refresh histories it read ~1.9x the true N).
+        # Weight reads by recency (half-life 24h) so the recent, slower
+        # growth regime sets the extrapolation.
         xs = [math.log1p(hours_since_release(m, release)) for m, _, _ in distinct]
         ys = [math.log(n) for _, n, _ in distinct]
-        fit_n = least_squares(xs, ys)
+        ws = [0.5 ** (max(0.0, (last_moment - m).total_seconds() / 3600.0) / 24.0)
+              for m, _, _ in distinct]
+        fit_n = weighted_least_squares(xs, ys, ws)
         if fit_n is not None and fit_n[0] > 0:
             n_target = math.exp(fit_n[1] + fit_n[0] * x_target)
         else:
@@ -242,8 +297,10 @@ def analyse_case(case):
         g_hat = PRIOR_GROWTH
         n_target = last_n * PRIOR_GROWTH
 
-    # -- median by cohort accounting + progress, trend as a cross-check -----
-    out = []
+    # -- pass 1: median by cohort accounting + progress ---------------------
+    # Per trophy: (earners_last, prog, cohort, med_c). The cohort and
+    # progress rates come from the two-component fit over the refresh steps.
+    recs = []
     for i in range(n_tr):
         earners_last = last_n * last_rates[i] / 100.0
         if steps:
@@ -251,56 +308,112 @@ def analyse_case(case):
             c_pool = sum(s[0] * s[4][i] for s in steps) / wsum
             prog, cohort = two_component(i, c_pool)
             dn_t = n_target - last_n
-            # Players already tracked keep earning (non-earners decay
-            # exponentially at the progress rate); new players earn at the
-            # cohort rate and then progress for half the horizon on average.
             exist_earn = (last_n - earners_last) * (1.0 - math.exp(-prog * horizon_h))
             new_earn = dn_t * (cohort + (1.0 - cohort)
                                * (1.0 - math.exp(-prog * horizon_h / 2.0)))
             earners_t = earners_last + exist_earn + new_earn
         else:
-            cohort = 1.0 if last_rates[i] >= 99.99 else PRIOR_BETA * last_rates[i] / 100.0
+            prog, cohort = 0.0, (1.0 if last_rates[i] >= 99.99
+                                 else PRIOR_BETA * last_rates[i] / 100.0)
             earners_t = earners_last + (n_target - last_n) * cohort
         rate_c = 100.0 * earners_t / n_target
-        med_c = logit_of(rate_c)
+        recs.append([earners_last, prog, cohort, logit_of(rate_c)])
 
+    # -- tier-pooled shrinkage ----------------------------------------------
+    # A rare trophy's own steps are a handful of earns: its fitted cohort
+    # and progress rates are mostly noise. Pull both toward the tier's
+    # earners-weighted pooled rates (pseudo-count SHRINK_E0 earners). The
+    # trophy everybody already has (rate 100%) is exempt: its cohort really
+    # is 1 and its progress really is 0.
+    if steps:
+        tiers = {}
+        for i, tr in enumerate(trophies):
+            tiers.setdefault(tr["tier"], []).append(i)
+        for members in tiers.values():
+            wsum_c = sum(recs[i][0] for i in members)
+            if wsum_c <= 0:
+                continue
+            c_tier = sum(recs[i][0] * recs[i][2] for i in members) / wsum_c
+            p_tier = sum(recs[i][0] * recs[i][1] for i in members) / wsum_c
+            for i in members:
+                if last_rates[i] >= 99.99:
+                    continue
+                e = recs[i][0]
+                recs[i][2] = (e * recs[i][2] + SHRINK_E0 * c_tier) / (e + SHRINK_E0)
+                recs[i][1] = (e * recs[i][1] + SHRINK_E0 * p_tier) / (e + SHRINK_E0)
+                # Recompute the accounting median with the shrunk rates.
+                prog, cohort = recs[i][1], recs[i][2]
+                dn_t = n_target - last_n
+                exist_earn = (last_n - e) * (1.0 - math.exp(-prog * horizon_h))
+                new_earn = dn_t * (cohort + (1.0 - cohort)
+                                   * (1.0 - math.exp(-prog * horizon_h / 2.0)))
+                earners_t = e + exist_earn + new_earn
+                recs[i][3] = logit_of(100.0 * earners_t / n_target)
+
+    # -- trend window: the recent reads only ---------------------------------
+    # A trophy's earn curve saturates (fast early, slow late), so a straight
+    # line in log-time over the WHOLE history fits badly: residuals of
+    # 0.5-1.0 logit that are model error, not forecast uncertainty. The last
+    # 24h of reads are locally almost linear; fit there (fall back to the
+    # whole history when fewer than 3 recent reads exist).
+    recent = [row for row in distinct
+              if (last_moment - row[0]).total_seconds() <= 24 * 3600.0]
+    trend_rows = recent if len(recent) >= 3 else distinct
+    trend_xs = [math.log1p(hours_since_release(m, release))
+                for m, _, _ in trend_rows]
+
+    # -- pass 2: trend blend + spread ----------------------------------------
+    out = []
+    for i in range(n_tr):
+        earners_last, _prog, _cohort, med_c = recs[i]
         med = med_c
         s_res = 0.0
-        s_disagree = 0.0
-        if len(distinct) >= 3:
-            xs = [math.log1p(hours_since_release(m, release))
-                  for m, _, _ in distinct]
-            ys = [logit_of(row[2][i]) for row in distinct]
-            fit = least_squares(xs, ys)
+        if len(trend_rows) >= 3:
+            ys = [logit_of(row[2][i]) for row in trend_rows]
+            fit = least_squares(trend_xs, ys)
             if fit is not None:
                 med_t = fit[1] + fit[0] * x_target
                 med_t = min(max(med_t, logit_of(0.01)), logit_of(99.99))
-                # 0.85 two-component accounting, 0.15 the observed log-time
-                # trend: the trend is a hedge for regimes where the
-                # accounting breaks (growth stalls, cadence changes); the
-                # accounting carries the dilution and the progress.
-                med = 0.85 * med_c + 0.15 * med_t
-                s_disagree = abs(med_c - med_t) / 2.0
+                # (1 - TREND_BLEND) accounting, TREND_BLEND the recent
+                # log-time trend: the trend is a hedge for regimes where
+                # the accounting breaks (growth stalls, cadence changes).
+                med = (1.0 - TREND_BLEND) * med_c + TREND_BLEND * med_t
                 s_res = fit[2]
 
-        # -- spread: steps disagreeing + trend residual + a floor -----------
+        # -- spread: honest components only ---------------------------------
+        # s_step_w: the refresh steps disagreeing about the target (weighted
+        # by step weight, so the launch explosion does not dominate);
+        # s_res: the recent trend's residual; N_SPREAD: the players-tracked
+        # extrapolation itself is uncertain (dilution moves every rate).
+        # Round 1 also added the accounting-vs-trend disagreement, but the
+        # trend is a hedge, not an independent estimate: its disagreement
+        # with the accounting median is model error already paid for by the
+        # blend, not extra forecast uncertainty.
         if steps and len(steps) >= 2:
-            implied = []
-            for s in steps:
-                e = earners_last + (n_target - last_n) * s[4][i]
-                implied.append(logit_of(100.0 * e / n_target))
-            mean_imp = sum(implied) / len(implied)
-            var_step = sum((v - mean_imp) ** 2 for v in implied) / len(implied)
+            dn_t = n_target - last_n
+            # Only recent steps feed the spread: the launch regime's cohort
+            # rates are not the future regime's, and their disagreement is
+            # not forecast uncertainty. Fall back to all steps when fewer
+            # than 2 are recent.
+            recent_idx = [k for k, row in enumerate(step_rows)
+                          if (last_moment - row[5]).total_seconds() / 3600.0
+                          <= STEP_WINDOW_H]
+            use_idx = recent_idx if len(recent_idx) >= 2 else list(range(len(steps)))
+            wsum = sum(steps[k][0] for k in use_idx)
+            mean_imp = sum(steps[k][0] * logit_of(100.0 * (earners_last + dn_t * steps[k][4][i]) / n_target)
+                           for k in use_idx) / wsum
+            var_step = sum(steps[k][0] * (logit_of(100.0 * (earners_last + dn_t * steps[k][4][i]) / n_target) - mean_imp) ** 2
+                           for k in use_idx) / wsum
             s_step = math.sqrt(var_step)
         else:
             s_step = 0.0
         if steps:
             spread = math.sqrt(FLOOR_SPREAD ** 2 + s_step ** 2
-                               + (0.5 * s_res) ** 2 + s_disagree ** 2)
+                               + (0.5 * min(s_res, 0.6)) ** 2 + N_SPREAD ** 2)
         else:
             spread = PRIOR_SPREAD
-        spread *= 1.0 + 0.08 * math.sqrt(horizon_d)
-        spread = min(1.20, max(0.12, spread))
+        spread *= 1.0 + HORIZON_COEF * math.sqrt(horizon_d)
+        spread = min(CAP_SPREAD, max(0.12, spread))
         out.append((med, spread))
     return out
 
